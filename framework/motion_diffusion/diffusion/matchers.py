@@ -320,16 +320,14 @@ class DecoderLatentMatcher(BaseLatentModel):
         }
         self.use_past_frames = cfg.get("use_past_frames", False)
         self.use_speaker_predictor = cfg.get("use_speaker_predictor", False)
-        self.use_stitch = cfg.get("use_stitch", False) if self.use_speaker_predictor else False
+        self.use_stitch = cfg.get("use_stitch", False)
 
-        # Force stitch off + disable future when predictor is off
+        # Stitch / future emotion params
         init_dict = dict(self.init_params)
-        if not self.use_speaker_predictor:
-            init_dict["use_stitch"] = False
-        else:
-            init_dict["use_stitch"] = self.use_stitch
-            init_dict["stitch_layers"] = cfg.get("stitch_layers", 2)
-            init_dict["s_future_emotion_enc_drop_prob"] = cfg.get("s_future_emotion_enc_drop_prob", 0.2)
+        init_dict["use_speaker_predictor"] = self.use_speaker_predictor
+        init_dict["use_stitch"] = self.use_stitch
+        init_dict["stitch_layers"] = cfg.get("stitch_layers", 2)
+        init_dict["s_future_emotion_enc_drop_prob"] = cfg.get("s_future_emotion_enc_drop_prob", 0.2)
 
         self.model = TransformerDenoiser(**init_dict)
 
@@ -420,6 +418,12 @@ class DecoderLatentMatcher(BaseLatentModel):
         if self.stage == "test":
             bs, l, _ = s_audio_encodings.shape  # bz * num_preds
             with torch.no_grad():
+
+                 # ==== 提速核心：在进入循环前算好特征并存入 kwargs ====
+                if hasattr(self.model, "precompute_for_test"):
+                    model_kwargs['cached_model_kwargs'] = self.model.precompute_for_test(bs, model_kwargs)
+                # ====================================================
+                
                 output = [output for output in self.decoder_diffusion.ddim_sample_loop_progressive(
                     matcher=self,
                     model=self.model,

@@ -10,7 +10,8 @@ from framework.motion_diffusion.diffusion.operator.cross_attention import (SkipT
                                                                            TransformerDecoder,
                                                                            TransformerDecoderLayer,
                                                                            TransformerEncoderLayer)
-from framework.motion_diffusion.diffusion.stitch_encoder2 import StitchEncoder
+from framework.motion_diffusion.diffusion.stitch_encoder import StitchEncoder as StitchEncoderV1
+from framework.motion_diffusion.diffusion.stitch_encoder2 import StitchEncoder as StitchEncoderV2
 
 
 def lengths_to_mask(lengths: List[int],
@@ -78,6 +79,7 @@ class TransformerDenoiser(nn.Module):
                  s_emotion_enc_drop_prob: float = 1.0,  # speaker_emotion_encodings
                  past_l_emotion_drop_prob: float = 1.0,  # past_listener_emotion
                  # ── Stitch encoder / future emotion params ──
+                 use_speaker_predictor: bool = False,
                  use_stitch: bool = False,
                  stitch_layers: int = 2,
                  s_future_emotion_enc_drop_prob: float = 0.2,
@@ -101,6 +103,7 @@ class TransformerDenoiser(nn.Module):
         self.s_3dmm_enc_drop_prob = s_3dmm_enc_drop_prob
         self.s_emotion_enc_drop_prob = s_emotion_enc_drop_prob
         self.past_l_emotion_drop_prob = past_l_emotion_drop_prob
+        self.use_speaker_predictor = use_speaker_predictor
         self.use_stitch = use_stitch
         self.s_future_emotion_enc_drop_prob = s_future_emotion_enc_drop_prob
 
@@ -118,13 +121,23 @@ class TransformerDenoiser(nn.Module):
         self.future_proj = nn.Linear(s_emotion_dim, self.latent_dim)
 
         if self.use_stitch:
-            self.stitch_encoder = StitchEncoder(
-                input_dims=[768, 58, 25, 25],
-                latent_dim=self.latent_dim,
-                modal_lengths=[60, 60, 60, 10],
-                num_layers=stitch_layers,
-                num_heads=num_heads,
-            )
+            if self.use_speaker_predictor:
+                # Online: 4-modality stitch (Audio + 3DMM + Emotion + Future)
+                self.stitch_encoder = StitchEncoderV2(
+                    input_dims=[768, 58, 25, 25],
+                    latent_dim=self.latent_dim,
+                    modal_lengths=[60, 60, 60, 10],
+                    num_layers=stitch_layers,
+                    num_heads=num_heads,
+                )
+            else:
+                # Offline: 3-modality stitch (Audio + 3DMM + Emotion)
+                self.stitch_encoder = StitchEncoderV1(
+                    input_dims=[768, 58, 25],
+                    latent_dim=self.latent_dim,
+                    num_layers=stitch_layers,
+                    num_heads=num_heads,
+                )
         else:
             self.speaker_audio_proj = nn.Linear(s_audio_dim, self.latent_dim) \
                 if s_audio_dim != self.latent_dim else nn.Identity()
@@ -226,32 +239,63 @@ class TransformerDenoiser(nn.Module):
 
         # ── Stitch or linear projection dispatch ──
         if self.use_stitch:
-            raw_audio = model_kwargs.get('speaker_audio_encodings')
-            raw_3dmm = model_kwargs.get("speaker_3dmm_encodings")
-            raw_emotion = model_kwargs.get("speaker_emotion_encodings")
-            raw_future = model_kwargs.get("speaker_future_emotion_prediction")
+            if self.use_speaker_predictor:
+                # ── Online: 4-modality stitch (Audio + 3DMM + Emotion + Future) ──
+                raw_audio = model_kwargs.get('speaker_audio_encodings')
+                raw_3dmm = model_kwargs.get("speaker_3dmm_encodings")
+                raw_emotion = model_kwargs.get("speaker_emotion_encodings")
+                raw_future = model_kwargs.get("speaker_future_emotion_prediction")
 
-            raw_audio = self.mask_cond(raw_audio, mode, self.s_audio_enc_drop_prob)
-            raw_3dmm = self.mask_cond(raw_3dmm, mode, self.s_3dmm_enc_drop_prob)
-            raw_emotion = self.mask_cond(raw_emotion, mode, self.s_emotion_enc_drop_prob)
-            if raw_future is None:
-                raw_future = torch.zeros(bs, 10, self.latent_dim).to(sample.device)
-            raw_future = self.mask_cond(raw_future, mode, self.s_future_emotion_enc_drop_prob)
+                raw_audio = self.mask_cond(raw_audio, mode, self.s_audio_enc_drop_prob)
+                raw_3dmm = self.mask_cond(raw_3dmm, mode, self.s_3dmm_enc_drop_prob)
+                raw_emotion = self.mask_cond(raw_emotion, mode, self.s_emotion_enc_drop_prob)
+                if raw_future is None:
+                    raw_future = torch.zeros(bs, 10, self.latent_dim).to(sample.device)
+                raw_future = self.mask_cond(raw_future, mode, self.s_future_emotion_enc_drop_prob)
 
-            fused_list = self.stitch_encoder([raw_audio, raw_3dmm, raw_emotion, raw_future])
+                fused_list = self.stitch_encoder([raw_audio, raw_3dmm, raw_emotion, raw_future])
 
-            speaker_audio_encodings = fused_list[0]
-            speaker_audio_encodings = self.s_audio_scale * speaker_audio_encodings
-            speaker_audio_encodings = speaker_audio_encodings.permute(1, 0, 2).contiguous()
+                speaker_audio_encodings = fused_list[0]
+                speaker_audio_encodings = self.s_audio_scale * speaker_audio_encodings
+                speaker_audio_encodings = speaker_audio_encodings.permute(1, 0, 2).contiguous()
 
-            speaker_3dmm_encodings = fused_list[1]
-            speaker_3dmm_encodings = speaker_3dmm_encodings.permute(1, 0, 2).contiguous()
+                speaker_3dmm_encodings = fused_list[1]
+                speaker_3dmm_encodings = speaker_3dmm_encodings.permute(1, 0, 2).contiguous()
 
-            speaker_emotion_encodings = fused_list[2]
-            speaker_emotion_encodings = speaker_emotion_encodings.permute(1, 0, 2).contiguous()
+                speaker_emotion_encodings = fused_list[2]
+                speaker_emotion_encodings = speaker_emotion_encodings.permute(1, 0, 2).contiguous()
 
-            speaker_future_emotion_prediction = fused_list[3]
-            speaker_future_emotion_prediction = speaker_future_emotion_prediction.permute(1, 0, 2).contiguous()
+                speaker_future_emotion_prediction = fused_list[3]
+                speaker_future_emotion_prediction = speaker_future_emotion_prediction.permute(1, 0, 2).contiguous()
+            else:
+                # ── Offline: 3-modality stitch (Audio + 3DMM + Emotion) ──
+                raw_audio = model_kwargs.get('speaker_audio_encodings')
+                raw_3dmm = model_kwargs.get("speaker_3dmm_encodings")
+                raw_emotion = model_kwargs.get("speaker_emotion_encodings")
+
+                raw_audio = self.mask_cond(raw_audio, mode, self.s_audio_enc_drop_prob)
+                raw_3dmm = self.mask_cond(raw_3dmm, mode, self.s_3dmm_enc_drop_prob)
+                raw_emotion = self.mask_cond(raw_emotion, mode, self.s_emotion_enc_drop_prob)
+
+                fused_list = self.stitch_encoder([raw_audio, raw_3dmm, raw_emotion])
+
+                speaker_audio_encodings = fused_list[0]
+                speaker_audio_encodings = self.s_audio_scale * speaker_audio_encodings
+                speaker_audio_encodings = speaker_audio_encodings.permute(1, 0, 2).contiguous()
+
+                speaker_3dmm_encodings = fused_list[1]
+                speaker_3dmm_encodings = speaker_3dmm_encodings.permute(1, 0, 2).contiguous()
+
+                speaker_emotion_encodings = fused_list[2]
+                speaker_emotion_encodings = speaker_emotion_encodings.permute(1, 0, 2).contiguous()
+
+                speaker_future_emotion_prediction = model_kwargs.get('speaker_future_emotion_prediction')
+                if speaker_future_emotion_prediction is None:
+                    speaker_future_emotion_prediction = torch.zeros(size=(bs, 0, self.latent_dim)).to(sample.device)
+                else:
+                    speaker_future_emotion_prediction = self.future_proj(speaker_future_emotion_prediction)
+                    speaker_future_emotion_prediction = self.mask_cond(speaker_future_emotion_prediction, mode, self.s_future_emotion_enc_drop_prob)
+                speaker_future_emotion_prediction = speaker_future_emotion_prediction.permute(1, 0, 2).contiguous()
         else:
             speaker_audio_encodings = model_kwargs.get('speaker_audio_encodings')
             if speaker_audio_encodings is None or self.s_audio_enc_drop_prob >= 1.0:
@@ -413,6 +457,28 @@ class TransformerDenoiser(nn.Module):
         sample = sample.permute(1, 0, 2)
 
         return sample
+    
+    def precompute_for_test(self, original_bs, model_kwargs):
+        "缓存测试时的静态特征融合，避免DDIM重复计算"
+        model_kwargs_copy = model_kwargs.copy()
+        # 1. 提前模拟CFG（无分类引导器）的batch翻倍与置零
+        for k, v in model_kwargs_copy.items():
+            if model_kwargs_copy[k] is None:
+                continue
+            model_kwargs_copy[k] = torch.cat(
+                (torch.zeros_like(model_kwargs_copy[k], dtype=model_kwargs_copy[k].dtype), model_kwargs_copy[k]),
+                dim=0)
+        bs = original_bs *2 
+        # 2. 拿一个真实的device占位
+        device = model_kwargs['speaker_audio_encodings'].device
+        fake_sample = torch.empty(bs, 1, 1, device=device)
+        # 3. 执行唯一一次的计算
+        return self.get_model_kwargs(
+            bs,
+            'test',
+            fake_sample,
+            model_kwargs_copy,
+        )
 
     def forward_with_cond_scale(
             self,
@@ -436,25 +502,34 @@ class TransformerDenoiser(nn.Module):
         else:
             model_kwargs = model_kwargs.copy()
         for k, v in model_kwargs.items():
-            if model_kwargs[k] is None:
+            if model_kwargs[k] is None or k == 'cached_model_kwargs':
                 continue
             model_kwargs[k] = torch.cat(
                 (torch.zeros_like(model_kwargs[k], dtype=model_kwargs[k].dtype), model_kwargs[k]),
                 dim=0)
 
-        (speaker_audio_encodings,
-         speaker_latent_embed,
-         speaker_3dmm_encodings,
-         speaker_emotion_encodings,
-         past_listener_emotion,
-         speaker_future_emotion_prediction) = (
-            self.get_model_kwargs(
-                bs,
-                'test',
-                sample,
-                model_kwargs,
+        # 优先读取提前算好的缓存特征（precompute_for_test 产出）
+        if 'cached_model_kwargs' in model_kwargs:
+            (speaker_audio_encodings,
+             speaker_latent_embed,
+             speaker_3dmm_encodings,
+             speaker_emotion_encodings,
+             past_listener_emotion,
+             speaker_future_emotion_prediction) = model_kwargs['cached_model_kwargs']
+        else:
+            (speaker_audio_encodings,
+             speaker_latent_embed,
+             speaker_3dmm_encodings,
+             speaker_emotion_encodings,
+             past_listener_emotion,
+             speaker_future_emotion_prediction) = (
+                self.get_model_kwargs(
+                    bs,
+                    'test',
+                    sample,
+                    model_kwargs,
+                )
             )
-        )
 
         # motion_length = torch.cat([motion_length] * 2, dim=0) if motion_length is not None else None
         prediction = self._forward(
