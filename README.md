@@ -58,7 +58,7 @@ configs/personalized_offline/trainer/perfrdiff_rewrite_weight.yaml
 
 ## 预训练权重
 
-**在线预训练权重**（TransformerDenoiser + EEGPredictionHead）已上传至夸克网盘：
+**在线预训练权重** 已上传至夸克网盘：
 
 > https://pan.quark.cn/s/cf449d1de0d4
 
